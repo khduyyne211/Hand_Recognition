@@ -4,14 +4,19 @@ import pickle
 import numpy as np
 import time
 from collections import deque
+import utils
 
 # =============================================
 # 1. LOAD MODEL
 # =============================================
 print("Đang tải model...")
-with open("model/model.pkl", "rb") as f:
-    model = pickle.load(f)
-print("Tải model thành công!")
+try:
+    with open("model/model.pkl", "rb") as f:
+        model = pickle.load(f)
+    print("Tải model thành công!")
+except FileNotFoundError:
+    print("❌ LỖI: Không tìm thấy model. Vui lòng chạy train_model.py trước!")
+    exit()
 
 # =============================================
 # 2. KHỞI TẠO MEDIAPIPE & CAMERA
@@ -24,10 +29,17 @@ hands = mp_hands.Hands(
     min_detection_confidence=0.7
 )
 cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    raise Exception("❌ LỖI: Không thể mở Camera. Vui lòng kiểm tra thiết bị.")
 
 # =============================================
 # 3. NHẬN DẠNG J VÀ Z BẰNG QUỸ ĐẠO
 # =============================================
+J_DY_THRESHOLD = 0.04
+J_DX_THRESHOLD = -0.03
+Z_DX_THRESHOLD = 0.005
+Z_DIR_CHANGES_THRESHOLD = 2
+
 wrist_history = deque(maxlen=15)
 
 def detect_J(history):
@@ -36,7 +48,7 @@ def detect_J(history):
     points = list(history)
     dx = points[-1][0] - points[0][0]
     dy = points[-1][1] - points[0][1]
-    return dy > 0.04 and dx < -0.03
+    return dy > J_DY_THRESHOLD and dx < J_DX_THRESHOLD
 
 def detect_Z(history):
     if len(history) < 12:
@@ -46,32 +58,29 @@ def detect_Z(history):
     prev_dir = None
     for i in range(1, len(points)):
         dx = points[i][0] - points[i-1][0]
-        if abs(dx) < 0.005:
+        if abs(dx) < Z_DX_THRESHOLD:
             continue
         curr_dir = 1 if dx > 0 else -1
         if prev_dir is not None and curr_dir != prev_dir:
             direction_changes += 1
         prev_dir = curr_dir
-    return direction_changes >= 2
+    return direction_changes >= Z_DIR_CHANGES_THRESHOLD
 
 # =============================================
 # 4. CÁC BIẾN THEO DÕI
 # =============================================
-sentence      = ""
-current_letter = ""
+confirmed_letter   = ""
+current_letter     = ""
 hold_start_time    = None
-hand_absent_time   = None
-space_added        = False
 last_confirmed_time = 0
 
 HOLD_TIME            = 1.0   # Giữ tư thế 1 giây
-ABSENT_TIME          = 0.8   # Rút tay 0.8 giây → thêm space
-COOLDOWN_TIME        = 0.5   # Chờ giữa 2 chữ
+COOLDOWN_TIME        = 0.5   # Chờ giữa 2 lần xác nhận
 CONFIDENCE_THRESHOLD = 0.85  # Độ tin cậy tối thiểu
 
 print("\nỨng dụng ASL đã khởi động!")
 print("Hỗ trợ 26 chữ cái A-Z (bao gồm J và Z)")
-print("Phím tắt: BACKSPACE=xóa chữ | C=xóa câu | Q=thoát\n")
+print("Phím tắt: C=xóa chữ đã xác nhận | Q=thoát\n")
 
 # =============================================
 # 5. VÒNG LẶP CHÍNH
@@ -88,9 +97,6 @@ while True:
     h, w   = frame.shape[:2]
 
     if result.multi_hand_landmarks:
-        hand_absent_time = None
-        space_added      = False
-
         for hand_landmarks in result.multi_hand_landmarks:
             mp_draw.draw_landmarks(
                 frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
@@ -99,10 +105,8 @@ while True:
             wrist = hand_landmarks.landmark[0]
             wrist_history.append((wrist.x, wrist.y))
 
-            # Trích xuất 63 landmark
-            landmarks = []
-            for lm in hand_landmarks.landmark:
-                landmarks.extend([lm.x, lm.y, lm.z])
+            # Trích xuất và chuẩn hoá 63 landmark
+            landmarks = utils.process_landmarks(hand_landmarks)
 
             # Dự đoán chữ
             prediction = model.predict([landmarks])[0]
@@ -120,13 +124,13 @@ while True:
             is_Z = detect_Z(wrist_history)
 
             if is_J and cooldown_ok:
-                sentence += "J"
+                confirmed_letter = "J"
                 last_confirmed_time = now
                 wrist_history.clear()
                 current_letter = "J"
 
             elif is_Z and cooldown_ok:
-                sentence += "Z"
+                confirmed_letter = "Z"
                 last_confirmed_time = now
                 wrist_history.clear()
                 current_letter = "Z"
@@ -134,7 +138,7 @@ while True:
             # --- Xác nhận chữ thường (giữ 1 giây) ---
             elif hold_duration >= HOLD_TIME and cooldown_ok:
                 if confidence >= CONFIDENCE_THRESHOLD:
-                    sentence += prediction
+                    confirmed_letter = prediction
                     last_confirmed_time = now
                     hold_start_time     = now
 
@@ -187,15 +191,6 @@ while True:
                     (10, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        # Tự động thêm SPACE khi rút tay
-        if not space_added:
-            if hand_absent_time is None:
-                hand_absent_time = now
-            elif now - hand_absent_time >= ABSENT_TIME:
-                if len(sentence) > 0 and sentence[-1] != " ":
-                    sentence += " "
-                    space_added = True
-
     # =============================================
     # 6. HIỂN THỊ GIAO DIỆN
     # =============================================
@@ -203,14 +198,14 @@ while True:
     # Header đen phía trên hiện câu
     cv2.rectangle(frame, (0, 0), (w, 50), (0, 0, 0), -1)
 
-    # Hiện câu (nếu dài thì cắt bớt từ đầu)
-    display_sentence = sentence[-35:] if len(sentence) > 35 else sentence
-    cv2.putText(frame, f"Cau: {display_sentence}",
+    # Hiện chữ đã xác nhận gần nhất
+    display_letter = confirmed_letter if confirmed_letter else "-"
+    cv2.putText(frame, f"Chu da xac nhan: {display_letter}",
                 (10, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
 
     # Hướng dẫn phía dưới
-    cv2.putText(frame, "BS=xoa chu | C=xoa cau | Q=thoat",
+    cv2.putText(frame, "C=xoa chu da xac nhan | Q=thoat",
                 (10, h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
@@ -222,10 +217,8 @@ while True:
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
-    elif key == 8:        # BACKSPACE
-        sentence = sentence[:-1]
-    elif key == ord('c'): # Xóa câu
-        sentence = ""
+    elif key == ord('c'): # Xóa chữ đã xác nhận
+        confirmed_letter = ""
 
 # =============================================
 # 8. GIẢI PHÓNG TÀI NGUYÊN

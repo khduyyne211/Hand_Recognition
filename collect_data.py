@@ -3,6 +3,7 @@ import mediapipe as mp
 import csv
 import os
 import time
+import utils
 
 # Khởi tạo MediaPipe
 mp_hands = mp.solutions.hands
@@ -80,12 +81,10 @@ while True:
         for hand_landmarks in result.multi_hand_landmarks:
             mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-            landmarks = []
-            for lm in hand_landmarks.landmark:
-                landmarks.extend([lm.x, lm.y, lm.z])
+            landmarks = utils.process_landmarks(hand_landmarks)
 
-            file_exists = os.path.exists("data/data.csv")
-            with open("data/data.csv", "a", newline="") as f:
+            file_exists = os.path.exists("data/data_custom.csv")
+            with open("data/data_custom.csv", "a", newline="") as f:
                 writer = csv.writer(f)
                 if not file_exists:
                     header = [f"{axis}{i}" for i in range(21) for axis in ["x", "y", "z"]]
